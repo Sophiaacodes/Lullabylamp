@@ -1,127 +1,195 @@
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <math.h> // Serve per il calcolo della curva esponenziale
+#include <math.h>
+
+// --- CREDENZIALI WI-FI (MODIFICA QUI!) ---
+const char* ssid = "IL_TUO_NOME_WIFI";
+const char* password = "LA_TUA_PASSWORD_WIFI";
 
 // --- CONFIGURAZIONE PIN ---
-const int PIN_MOSFET = 16;  
-const int PIN_TOUCH = 4;    
+const int PIN_MOSFET = 16;
+const int PIN_TOUCH = 4;
 
-// --- CONFIGURAZIONE TRAMONTO ---
-const int SUNSET_HOUR = 20;      // Ora di inizio (es. 20)
-const int SUNSET_MINUTE = 30;    // Minuto di inizio (es. 30)
-const int SUNSET_DURATION_MIN = 15; // DURATA TOTALE in minuti (es. 15 minuti)
-
-// --- PARAMETRI MATEMATICI (SEZIONE AUREA) ---
-// 1.618 è il numero d'oro (Phi). 
-// Più alzi questo numero (es. 2.0 o 3.0), più la luce resterà accesa a lungo per poi crollare alla fine.
-// Se metti 1.0, il tramonto sarà perfettamente lineare.
-const float PHI_EXPONENT = 1.618; 
+// --- PARAMETRI TRAMONTO ---
+// Durata standard se attivato manualmente (es. timer prima di dormire)
+unsigned long standardDurationMinutes = 30; 
+// Durata "BIOFEEDBACK": se ti addormenti, sfuma in questi minuti
+const unsigned long SLEEP_DETECTED_DURATION_MIN = 15; 
 
 // --- SETUP TECNICO ---
+RTC_DS1307 rtc; // Usa RTC_DS3231 se hai quello
+WebServer server(80); // Il server che ascolta il comando "Dorme"
+
 const int PWM_FREQ = 5000;
 const int PWM_CHANNEL = 0;
-const int PWM_RESOLUTION = 8; 
+const int PWM_RESOLUTION = 8;
 
-RTC_DS1307 rtc; // Cambia in RTC_DS3231 se usi quello
-
+// Variabili di Stato
 int currentBrightness = 0;
 bool isLightOn = false;
 bool isSunsetMode = false;
-int lastTouchState = LOW;
-
-// Variabili per il calcolo del tempo
 unsigned long sunsetStartTime = 0;
-unsigned long totalDurationMillis = 0;
+unsigned long currentDurationMillis = 0; // Durata variabile (può cambiare se ti addormenti)
+int lastTouchState = LOW;
 
 void setup() {
   Serial.begin(115200);
 
-  // Configurazione PWM
+  // 1. Configurazione PWM (Luci)
   ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0); 
+  ledcWrite(PWM_CHANNEL, 0);
 
-  // Avvio Orologio
+  // 2. Configurazione Touch
+  pinMode(PIN_TOUCH, INPUT);
+
+  // 3. Avvio RTC
   if (!rtc.begin()) {
-    Serial.println("ERRORE: RTC non trovato!");
-    while (1);
+    Serial.println("ERRORE: RTC non trovato (Funzionerà solo in modalità manuale)");
+  }
+  rtc.adjust(DateTime(__DATE__, __TIME__)); // Scommenta solo per settare l'ora
+
+  // 4. Connessione Wi-Fi
+  Serial.print("Connessione al Wi-Fi");
+  WiFi.begin(ssid, password);
+  int tentativi = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativi < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativi++;
   }
   
-  // rtc.adjust(DateTime(__DATE__, __TIME__)); // Togli le barre solo se devi risincronizzare
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi Connesso!");
+    Serial.print("Indirizzo IP Lampada: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWi-Fi non connesso. La lampada lavorerà offline.");
+  }
 
-  pinMode(PIN_TOUCH, INPUT);
+  // 5. Configurazione Comandi "Biofeedback" (Web Server)
   
-  // Calcolo durata in millisecondi (Minuti * 60 * 1000)
-  totalDurationMillis = (unsigned long)SUNSET_DURATION_MIN * 60 * 1000;
-  
-  Serial.println("Sistema Avviato con Curva Aurea.");
+  // Pagina base per testare se è viva
+  server.on("/", []() {
+    server.send(200, "text/plain", "Lampada ESP32 Online. Comandi disponibili: /manual, /sleep");
+  });
+
+  // COMANDO MANUALE: Avvia tramonto standard (es. 30 min)
+  server.on("/manual", []() {
+    if (!isLightOn) { 
+      isLightOn = true; 
+      currentBrightness = 255; 
+    }
+    avviaTramonto(standardDurationMinutes);
+    server.send(200, "text/plain", "Tramonto Manuale Avviato");
+  });
+
+  // COMANDO BIOFEEDBACK: "L'utente si è addormentato!"
+  server.on("/sleep", []() {
+    Serial.println(">>> SEGNALE BIOFEEDBACK RICEVUTO: UTENTE DORME <<<");
+    
+    // Se la luce è spenta, non fare nulla (inutile accenderla per spegnerla)
+    if (!isLightOn && currentBrightness == 0) {
+      server.send(200, "text/plain", "Luce già spenta. Buonanotte.");
+      return;
+    }
+    
+    // Logica Intelligente:
+    // Ricalibra il tramonto per durare esattamente 15 minuti da ORA.
+    // Indipendentemente da quanto mancava prima.
+    avviaTramonto(SLEEP_DETECTED_DURATION_MIN);
+    
+    server.send(200, "text/plain", "Biofeedback Ricevuto. Spegnimento in 15 min.");
+  });
+
+  server.begin();
+  Serial.println("Server Avviato.");
 }
 
 void loop() {
-  DateTime now = rtc.now();
+  // --- OROLOGIO PARLANTE (DEBUG) ---
+  static unsigned long lastDebugPrint = 0;
   
-  // --- CONTROLLO TOUCH ---
-  int touchState = digitalRead(PIN_TOUCH);
-  
-  if (touchState == HIGH && lastTouchState == LOW) {
-    isSunsetMode = false; // Interrompe il tramonto
-    isLightOn = !isLightOn; // Inverte
+  // Stampa solo se è passato 1 secondo
+  if (millis() - lastDebugPrint > 1000) {
+    lastDebugPrint = millis();
+    DateTime now = rtc.now();
     
+    Serial.print("ORA ATTUALE RTC: ");
+    Serial.print(now.hour());
+    Serial.print(":");
+    if (now.minute() < 10) Serial.print("0"); // Aggiunge lo zero estetico
+    Serial.print(now.minute());
+    Serial.print(":");
+    if (now.second() < 10) Serial.print("0");
+    Serial.println(now.second());
+  }
+  // Gestione richieste Wi-Fi (non bloccante)
+  server.handleClient();
+  
+  // Gestione Touch
+  handleTouch();
+
+  // Gestione Tramonto (Logica Matematica)
+  if (isSunsetMode) {
+    gestisciDissolvenza();
+  }
+}
+
+// --- FUNZIONI AUSILIARIE ---
+
+void handleTouch() {
+  int touchState = digitalRead(PIN_TOUCH);
+  if (touchState == HIGH && lastTouchState == LOW) {
+    isSunsetMode = false; // Il tocco annulla sempre il tramonto
+    isLightOn = !isLightOn;
     currentBrightness = isLightOn ? 255 : 0;
     ledcWrite(PWM_CHANNEL, currentBrightness);
-    
-    Serial.print("Touch: Luce ");
-    Serial.println(isLightOn ? "ON" : "OFF");
-    delay(500); 
+    Serial.println(isLightOn ? "Touch: ON" : "Touch: OFF");
+    delay(300); // Debounce
   }
   lastTouchState = touchState;
+}
 
-  // --- CONTROLLO ORARIO ---
-  if (now.hour() == SUNSET_HOUR && now.minute() == SUNSET_MINUTE && isLightOn && !isSunsetMode) {
-    if (currentBrightness > 0) {
-      isSunsetMode = true;
-      sunsetStartTime = millis(); // Memorizza l'istante preciso in cui inizia
-      Serial.println(">>> Inizio Tramonto Aureo (Phi)");
-    }
-  }
+void avviaTramonto(unsigned long minutiDurata) {
+  isSunsetMode = true;
+  sunsetStartTime = millis();
+  currentDurationMillis = minutiDurata * 60 * 1000;
+  Serial.print("Inizio Tramonto. Durata prevista: ");
+  Serial.print(minutiDurata);
+  Serial.println(" minuti.");
+}
 
-  // --- ALGORITMO TRAMONTO AUREO ---
-  if (isSunsetMode) {
-    unsigned long timeElapsed = millis() - sunsetStartTime;
+void gestisciDissolvenza() {
+  unsigned long timeElapsed = millis() - sunsetStartTime;
 
-    // Se il tempo è scaduto, spegni tutto
-    if (timeElapsed >= totalDurationMillis) {
-      currentBrightness = 0;
-      isSunsetMode = false;
-      isLightOn = false;
-      ledcWrite(PWM_CHANNEL, 0);
-      Serial.println("Tramonto completato.");
-    } 
-    else {
-      // CALCOLO DELLA CURVA
-      // 1. Calcoliamo la percentuale di tempo passato (da 0.0 a 1.0)
-      float progress = (float)timeElapsed / totalDurationMillis;
-      
-      // 2. Applichiamo la formula inversa della potenza basata su Phi
-      // La formula "1 - pow(progress, PHI)" fa sì che la luminosità scenda piano all'inizio e veloce alla fine.
-      float curveValue = 1.0 - pow(progress, 1.0 / PHI_EXPONENT * 4); 
-      // Nota: ho moltiplicato per 4 l'esponente per accentuare l'effetto "lento poi veloce"
-      
-      // Se vuoi essere matematicamente puro usa: float curveValue = 1.0 - pow(progress, PHI_EXPONENT);
-      // Ma visivamente l'occhio umano percepisce la luce in modo logaritmico, quindi dobbiamo compensare.
-      
-      // Mappiamo il valore della curva (0.0 - 1.0) su 255
-      int newBrightness = (int)(curveValue * 255);
-      
-      // Sicurezza per non andare sotto zero
-      if (newBrightness < 0) newBrightness = 0;
+  if (timeElapsed >= currentDurationMillis) {
+    // Fine del tempo
+    currentBrightness = 0;
+    isSunsetMode = false;
+    isLightOn = false;
+    ledcWrite(PWM_CHANNEL, 0);
+    Serial.println("Tramonto completato (Buonanotte).");
+  } else {
+    // --- MATEMATICA LOGARITMICA (Gamma Correction) ---
+    // Questa formula è molto più morbida per il sonno rispetto alla sezione aurea pura.
+    // Scende veloce all'inizio (toglie il bagliore) e lentissimo alla fine.
+    
+    float progress = (float)timeElapsed / currentDurationMillis;
+    float linearValue = 1.0 - progress;
+    
+    // pow(valore, 2.5) crea la curva "pancia in basso" (logaritmica inversa)
+    // Più alto è il numero (es. 3.0), più scuro diventa velocemente restando fioco a lungo.
+    int newBrightness = (int)(pow(linearValue, 2.5) * 255);
 
-      // Applichiamo solo se il valore è cambiato
-      if (newBrightness != currentBrightness) {
-        currentBrightness = newBrightness;
-        ledcWrite(PWM_CHANNEL, currentBrightness);
-        // Serial.println(currentBrightness); // Scommenta per vedere i numeri scendere
-      }
+    if (newBrightness < 0) newBrightness = 0;
+
+    if (newBrightness != currentBrightness) {
+      currentBrightness = newBrightness;
+      ledcWrite(PWM_CHANNEL, currentBrightness);
+      // Serial.println(currentBrightness); // Debug
     }
   }
 }
