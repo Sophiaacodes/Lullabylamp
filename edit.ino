@@ -4,192 +4,243 @@
 #include <RTClib.h>
 #include <math.h>
 
-// --- CREDENZIALI WI-FI (MODIFICA QUI!) ---
-const char* ssid = "IL_TUO_NOME_WIFI";
-const char* password = "LA_TUA_PASSWORD_WIFI";
+// --- WIFI CREDENTIALS ---
+const char* ssid = "WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// --- CONFIGURAZIONE PIN ---
+// --- PIN CONFIGURATION ---
 const int PIN_MOSFET = 16;
 const int PIN_TOUCH = 4;
 
-// --- PARAMETRI TRAMONTO ---
-// Durata standard se attivato manualmente (es. timer prima di dormire)
-unsigned long standardDurationMinutes = 30; 
-// Durata "BIOFEEDBACK": se ti addormenti, sfuma in questi minuti
-const unsigned long SLEEP_DETECTED_DURATION_MIN = 15; 
+// --- DURATION SETTINGS (Minutes) ---
+const unsigned long DURATION_SUNSET_SLEEP = 10;   // Short sunset triggered by Sleep App
+const unsigned long DURATION_SUNRISE_ALARM = 30;  // Sunrise triggered by Alarm
+unsigned long standardDurationMinutes = 30;       // Manual sunset triggered via browser/button
 
-// --- SETUP TECNICO ---
-RTC_DS1307 rtc; // Usa RTC_DS3231 se hai quello
-WebServer server(80); // Il server che ascolta il comando "Dorme"
+// --- OBJECTS ---
+RTC_DS1307 rtc; 
+WebServer server(80);
 
+// --- PWM SETTINGS ---
 const int PWM_FREQ = 5000;
 const int PWM_CHANNEL = 0;
 const int PWM_RESOLUTION = 8;
 
-// Variabili di Stato
+// --- SYSTEM STATES ---
 int currentBrightness = 0;
 bool isLightOn = false;
 bool isSunsetMode = false;
-unsigned long sunsetStartTime = 0;
-unsigned long currentDurationMillis = 0; // Durata variabile (può cambiare se ti addormenti)
+bool isSunriseMode = false;
+
+// --- TIMING VARIABLES ---
+unsigned long animationStartTime = 0;
+unsigned long currentDurationMillis = 0;
 int lastTouchState = LOW;
+
+// --- FUNCTION PROTOTYPES ---
+void handleTouch();
+void startSunset(unsigned long durationMinutes);
+void startSunrise(unsigned long durationMinutes);
+void updateSunset();
+void updateSunrise();
 
 void setup() {
   Serial.begin(115200);
 
-  // 1. Configurazione PWM (Luci)
+  // 1. PWM Configuration (LED Control)
   ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
   ledcWrite(PWM_CHANNEL, 0);
 
-  // 2. Configurazione Touch
+  // 2. Touch Sensor Configuration
   pinMode(PIN_TOUCH, INPUT);
 
-  // 3. Avvio RTC
+  // 3. RTC Configuration (Smart Adjust)
   if (!rtc.begin()) {
-    Serial.println("ERRORE: RTC non trovato (Funzionerà solo in modalità manuale)");
+    Serial.println("ERROR: RTC not found");
   }
-  rtc.adjust(DateTime(__DATE__, __TIME__)); // Scommenta solo per settare l'ora
 
-  // 4. Connessione Wi-Fi
-  Serial.print("Connessione al Wi-Fi");
+  // CHECK: If RTC is not running (e.g., new battery), set the time to compile time.
+  // If it IS running, do NOT change the time. This prevents the "reset loop".
+  if (!rtc.isrunning()) {
+    Serial.println("RTC is NOT running. Setting time to compile time...");
+    rtc.adjust(DateTime(__DATE__, __TIME__));
+  } else {
+    Serial.println("RTC is running. Time is preserved.");
+  }
+
+  // 4. Wi-Fi Connection
+  Serial.print("Connecting to Wi-Fi");
   WiFi.begin(ssid, password);
-  int tentativi = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativi < 20) {
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
-    tentativi++;
+    attempts++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Connesso!");
-    Serial.print("Indirizzo IP Lampada: ");
+    Serial.println("\nWi-Fi Connected!");
+    Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nWi-Fi non connesso. La lampada lavorerà offline.");
+    Serial.println("\nWi-Fi Offline. Manual mode only.");
   }
 
-  // 5. Configurazione Comandi "Biofeedback" (Web Server)
-  
-  // Pagina base per testare se è viva
-  server.on("/", []() {
-    server.send(200, "text/plain", "Lampada ESP32 Online. Comandi disponibili: /manual, /sleep");
-  });
+  // --- WEB SERVER ENDPOINTS ---
 
-  // COMANDO MANUALE: Avvia tramonto standard (es. 30 min)
-  server.on("/manual", []() {
-    if (!isLightOn) { 
-      isLightOn = true; 
-      currentBrightness = 255; 
-    }
-    avviaTramonto(standardDurationMinutes);
-    server.send(200, "text/plain", "Tramonto Manuale Avviato");
-  });
-
-  // COMANDO BIOFEEDBACK: "L'utente si è addormentato!"
+  // Endpoint: SLEEP (Triggered by Android App when user falls asleep)
   server.on("/sleep", []() {
-    Serial.println(">>> SEGNALE BIOFEEDBACK RICEVUTO: UTENTE DORME <<<");
-    
-    // Se la luce è spenta, non fare nulla (inutile accenderla per spegnerla)
+    // Logic: If light is already OFF, ignore sleep command.
     if (!isLightOn && currentBrightness == 0) {
-      server.send(200, "text/plain", "Luce già spenta. Buonanotte.");
+      server.send(200, "text/plain", "Ignored: Light is already OFF.");
+      return; 
+    }
+    
+    // Logic: If Sunrise is active (morning), ignore sleep command.
+    if (isSunriseMode) {
+       server.send(200, "text/plain", "Ignored: Sunrise in progress.");
+       return;
+    }
+
+    Serial.println(">>> SLEEP TRIGGERED: Starting short sunset <<<");
+    startSunset(DURATION_SUNSET_SLEEP);
+    server.send(200, "text/plain", "Goodnight. Sunset started (10 min).");
+  });
+
+  // Endpoint: SUNRISE (Triggered by Android App Alarm)
+  server.on("/sunrise", []() {
+    Serial.println(">>> WAKE UP: Starting sunrise <<<");
+    
+    // Logic: If light is already MAX, ignore.
+    if (isLightOn && currentBrightness == 255) {
+      server.send(200, "text/plain", "Ignored: Light already ON.");
       return;
     }
-    
-    // Logica Intelligente:
-    // Ricalibra il tramonto per durare esattamente 15 minuti da ORA.
-    // Indipendentemente da quanto mancava prima.
-    avviaTramonto(SLEEP_DETECTED_DURATION_MIN);
-    
-    server.send(200, "text/plain", "Biofeedback Ricevuto. Spegnimento in 15 min.");
+
+    startSunrise(DURATION_SUNRISE_ALARM);
+    server.send(200, "text/plain", "Good morning. Sunrise started (30 min).");
+  });
+
+  // Endpoint: MANUAL (Triggered via Browser for reading/relaxing)
+  server.on("/manual", []() {
+    // If light is off, turn it on first
+    if (!isLightOn) { 
+      isLightOn = true; 
+      ledcWrite(PWM_CHANNEL, 255); 
+    }
+    startSunset(standardDurationMinutes);
+    server.send(200, "text/plain", "Manual Sunset Started (30 min).");
+  });
+
+  // Endpoint: ROOT (Status check)
+  server.on("/", []() {
+    String status = "System Online.\n";
+    status += "Light: " + String(isLightOn ? "ON" : "OFF") + "\n";
+    status += "Time: " + String(rtc.now().hour()) + ":" + String(rtc.now().minute());
+    server.send(200, "text/plain", status);
   });
 
   server.begin();
-  Serial.println("Server Avviato.");
+  Serial.println("Web Server Started.");
 }
 
 void loop() {
-  // --- OROLOGIO PARLANTE (DEBUG) ---
-  static unsigned long lastDebugPrint = 0;
-  
-  // Stampa solo se è passato 1 secondo
-  if (millis() - lastDebugPrint > 1000) {
-    lastDebugPrint = millis();
-    DateTime now = rtc.now();
-    
-    Serial.print("ORA ATTUALE RTC: ");
-    Serial.print(now.hour());
-    Serial.print(":");
-    if (now.minute() < 10) Serial.print("0"); // Aggiunge lo zero estetico
-    Serial.print(now.minute());
-    Serial.print(":");
-    if (now.second() < 10) Serial.print("0");
-    Serial.println(now.second());
-  }
-  // Gestione richieste Wi-Fi (non bloccante)
   server.handleClient();
-  
-  // Gestione Touch
   handleTouch();
-
-  // Gestione Tramonto (Logica Matematica)
-  if (isSunsetMode) {
-    gestisciDissolvenza();
-  }
+  
+  if (isSunsetMode) updateSunset();
+  if (isSunriseMode) updateSunrise();
 }
 
-// --- FUNZIONI AUSILIARIE ---
+// --- CORE FUNCTIONS ---
+
+void startSunset(unsigned long durationMinutes) {
+  isSunsetMode = true;
+  isSunriseMode = false; // Stop sunrise if active
+  animationStartTime = millis();
+  currentDurationMillis = durationMinutes * 60 * 1000;
+  isLightOn = true; // Technically on during dimming
+}
+
+void startSunrise(unsigned long durationMinutes) {
+  isSunriseMode = true;
+  isSunsetMode = false; // Stop sunset if active
+  animationStartTime = millis();
+  currentDurationMillis = durationMinutes * 60 * 1000;
+  
+  isLightOn = true; 
+  currentBrightness = 0; // Start from black
+  ledcWrite(PWM_CHANNEL, 0);
+}
 
 void handleTouch() {
   int touchState = digitalRead(PIN_TOUCH);
+  
+  // Detect Rising Edge (Touch detected)
   if (touchState == HIGH && lastTouchState == LOW) {
-    isSunsetMode = false; // Il tocco annulla sempre il tramonto
+    // MANUAL OVERRIDE: Touch stops everything.
+    isSunsetMode = false;
+    isSunriseMode = false;
+    
+    // Toggle Light
     isLightOn = !isLightOn;
     currentBrightness = isLightOn ? 255 : 0;
     ledcWrite(PWM_CHANNEL, currentBrightness);
-    Serial.println(isLightOn ? "Touch: ON" : "Touch: OFF");
+    
+    Serial.println(isLightOn ? "Touch: Light ON" : "Touch: Light OFF");
     delay(300); // Debounce
   }
   lastTouchState = touchState;
 }
 
-void avviaTramonto(unsigned long minutiDurata) {
-  isSunsetMode = true;
-  sunsetStartTime = millis();
-  currentDurationMillis = minutiDurata * 60 * 1000;
-  Serial.print("Inizio Tramonto. Durata prevista: ");
-  Serial.print(minutiDurata);
-  Serial.println(" minuti.");
-}
+// --- MATH & ANIMATION ---
 
-void gestisciDissolvenza() {
-  unsigned long timeElapsed = millis() - sunsetStartTime;
-
+void updateSunset() {
+  unsigned long timeElapsed = millis() - animationStartTime;
+  
   if (timeElapsed >= currentDurationMillis) {
-    // Fine del tempo
-    currentBrightness = 0;
+    // Animation Finished
+    ledcWrite(PWM_CHANNEL, 0);
     isSunsetMode = false;
     isLightOn = false;
-    ledcWrite(PWM_CHANNEL, 0);
-    Serial.println("Tramonto completato (Buonanotte).");
+    currentBrightness = 0;
+    Serial.println("Sunset Complete. Light OFF.");
   } else {
-    // --- MATEMATICA LOGARITMICA (Gamma Correction) ---
-    // Questa formula è molto più morbida per il sonno rispetto alla sezione aurea pura.
-    // Scende veloce all'inizio (toglie il bagliore) e lentissimo alla fine.
-    
     float progress = (float)timeElapsed / currentDurationMillis;
-    float linearValue = 1.0 - progress;
+    float remaining = 1.0 - progress;
     
-    // pow(valore, 2.5) crea la curva "pancia in basso" (logaritmica inversa)
-    // Più alto è il numero (es. 3.0), più scuro diventa velocemente restando fioco a lungo.
-    int newBrightness = (int)(pow(linearValue, 2.5) * 255);
-
-    if (newBrightness < 0) newBrightness = 0;
-
+    // Gamma 5.0 Curve: Drops fast initially, long tail at the end.
+    // Ideal for sleep induction.
+    int newBrightness = (int)(pow(remaining, 5.0) * 255);
+    
     if (newBrightness != currentBrightness) {
       currentBrightness = newBrightness;
       ledcWrite(PWM_CHANNEL, currentBrightness);
-      // Serial.println(currentBrightness); // Debug
+    }
+  }
+}
+
+void updateSunrise() {
+  unsigned long timeElapsed = millis() - animationStartTime;
+  
+  if (timeElapsed >= currentDurationMillis) {
+    // Animation Finished
+    ledcWrite(PWM_CHANNEL, 255);
+    isSunriseMode = false;
+    isLightOn = true;
+    currentBrightness = 255;
+    Serial.println("Sunrise Complete. Light MAX.");
+  } else {
+    float progress = (float)timeElapsed / currentDurationMillis;
+    
+    // Inverse Gamma 3.0 Curve: Rises very slowly initially.
+    // Prevents waking up with a shock.
+    int newBrightness = (int)(pow(progress, 3.0) * 255);
+    
+    if (newBrightness != currentBrightness) {
+      currentBrightness = newBrightness;
+      ledcWrite(PWM_CHANNEL, currentBrightness);
     }
   }
 }
